@@ -13,6 +13,23 @@ app.use(express.static(path.join(__dirname, "..", "public")));
 
 const analyses = new Map();
 const chats = new Map();
+const analyzeAttempts = new Map();
+
+const MODEL_LEVELS = ["basic", "standard", "advanced"];
+
+const runtimeConfig = {
+  openaiApiKey: process.env.OPENAI_API_KEY?.trim() || "",
+  defaultModelLevel: "standard"
+};
+
+const MODEL_BY_LEVEL = {
+  basic: process.env.OPENAI_MODEL_BASIC || process.env.OPENAI_MODEL || "gpt-4.1-mini",
+  standard: process.env.OPENAI_MODEL_STANDARD || process.env.OPENAI_MODEL || "gpt-4.1-mini",
+  advanced: process.env.OPENAI_MODEL_ADVANCED || process.env.OPENAI_MODEL || "gpt-4.1-mini"
+};
+
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX = 5;
 
 const IDEAS_POOL = [
   "AI-ассистент продаж",
@@ -87,6 +104,10 @@ const QUESTION_FLOW = [
   }
 ];
 
+function normalizeModelLevel(input) {
+  return MODEL_LEVELS.includes(input) ? input : runtimeConfig.defaultModelLevel;
+}
+
 function normalizeUrl(input) {
   if (typeof input !== "string") return null;
   const trimmed = input.trim();
@@ -105,30 +126,199 @@ function sample(text, max = 1200) {
   return (text || "").replace(/\s+/g, " ").trim().slice(0, max);
 }
 
+function uniqId(prefix) {
+  return `${prefix}_${crypto.randomBytes(4).toString("hex")}`;
+}
+
+function getClientIp(req) {
+  const xff = req.headers["x-forwarded-for"];
+  if (typeof xff === "string" && xff.length) return xff.split(",")[0].trim();
+  return req.ip || req.socket?.remoteAddress || "unknown";
+}
+
+function checkAnalyzeRateLimit(ip) {
+  const now = Date.now();
+  const current = analyzeAttempts.get(ip) || [];
+  const fresh = current.filter((ts) => now - ts < RATE_LIMIT_WINDOW_MS);
+
+  if (fresh.length >= RATE_LIMIT_MAX) {
+    analyzeAttempts.set(ip, fresh);
+    return false;
+  }
+
+  fresh.push(now);
+  analyzeAttempts.set(ip, fresh);
+  return true;
+}
+
+async function fetchWithTimeout(url, timeoutMs) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      signal: controller.signal,
+      headers: { "User-Agent": "KonsultantBot/0.4" }
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchWithRetry(url, { retries = 2, timeoutMs = 7000 } = {}) {
+  let lastError = null;
+
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      const response = await fetchWithTimeout(url, timeoutMs);
+      if ((response.status === 429 || response.status >= 500) && attempt < retries) {
+        await new Promise((resolve) => setTimeout(resolve, 350 * (attempt + 1)));
+        continue;
+      }
+      return response;
+    } catch (error) {
+      lastError = error;
+      if (attempt < retries) {
+        await new Promise((resolve) => setTimeout(resolve, 350 * (attempt + 1)));
+      }
+    }
+  }
+
+  throw lastError || new Error("fetch_failed");
+}
+
+function getOpenAiKey() {
+  return runtimeConfig.openaiApiKey;
+}
+
+function hasOpenAiKey() {
+  return Boolean(getOpenAiKey());
+}
+
+function getModelForLevel(modelLevel) {
+  return MODEL_BY_LEVEL[normalizeModelLevel(modelLevel)] || MODEL_BY_LEVEL.standard;
+}
+
+function getTemperatureByLevel(modelLevel) {
+  if (modelLevel === "basic") return 0.55;
+  if (modelLevel === "advanced") return 0.3;
+  return 0.45;
+}
+
+async function callResponsesApi({ prompt, modelLevel = "standard" }) {
+  const apiKey = getOpenAiKey();
+  if (!apiKey) throw new Error("OPENAI_KEY_MISSING");
+
+  const model = getModelForLevel(modelLevel);
+  const temperature = getTemperatureByLevel(modelLevel);
+
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model,
+      temperature,
+      input: prompt
+    })
+  });
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => "");
+    throw new Error(`OPENAI_API_ERROR:${response.status}:${errText.slice(0, 240)}`);
+  }
+
+  const data = await response.json();
+  const text = typeof data?.output_text === "string" ? data.output_text : "";
+  return text.trim();
+}
+
+function parseIdeaListFromText(text) {
+  const start = text.indexOf("[");
+  const end = text.lastIndexOf("]");
+  if (start === -1 || end === -1 || end <= start) return null;
+
+  try {
+    const parsed = JSON.parse(text.slice(start, end + 1));
+    if (!Array.isArray(parsed)) return null;
+
+    return parsed
+      .map((item) => ({
+        title: String(item?.title || "").trim(),
+        description: String(item?.description || "").trim()
+      }))
+      .filter((item) => item.title && item.description)
+      .slice(0, 5);
+  } catch {
+    return null;
+  }
+}
+
+async function generateIdeasWithLlm(companyContext, excludedTitles, modelLevel) {
+  const prompt = [
+    "Ты консультант по внедрению ИИ.",
+    "Сформируй ровно 5 уникальных идей проектов на русском языке.",
+    "Верни только JSON-массив без markdown и пояснений.",
+    "Формат каждого элемента: {\"title\":\"...\",\"description\":\"...\"}.",
+    "Описание 80-220 символов, практично и конкретно.",
+    `Исключи названия: ${excludedTitles.length ? excludedTitles.join(", ") : "нет"}.`,
+    "Контекст компании:",
+    companyContext
+  ].join("\n");
+
+  const llmText = await callResponsesApi({ prompt, modelLevel });
+  return parseIdeaListFromText(llmText);
+}
+
+async function generateFinalWithLlm({ ideaTitle, answers, companyContext, modelLevel }) {
+  const answersText = answers.map((item) => `- ${item.question}: ${item.value}`).join("\n");
+
+  const prompt = [
+    "Подготовь консультацию по проекту внедрения ИИ на русском языке.",
+    "Структура строго из 6 разделов с заголовками:",
+    "1) Суть проекта",
+    "2) Потенциальная выгода",
+    "3) Оценка сроков",
+    "4) Оценка бюджета",
+    "5) Ключевые риски",
+    "6) Что критически важно учесть",
+    "Без markdown-таблиц и без лишних вводных фраз.",
+    `Название проекта: ${ideaTitle}`,
+    "Контекст компании:",
+    companyContext,
+    "Ответы пользователя:",
+    answersText
+  ].join("\n");
+
+  return callResponsesApi({ prompt, modelLevel });
+}
+
 async function collectContext(normalizedUrl) {
   const warnings = [];
   let html = "";
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 7000);
-    const res = await fetch(normalizedUrl, {
-      signal: controller.signal,
-      headers: { "User-Agent": "KonsultantBot/0.1" }
-    });
-    clearTimeout(timeout);
 
-    if (!res.ok) {
-      warnings.push(`Источник сайта вернул статус ${res.status}.`);
+  try {
+    const response = await fetchWithRetry(normalizedUrl, { retries: 2, timeoutMs: 7000 });
+
+    if (!response.ok) {
+      warnings.push(`Источник сайта вернул статус ${response.status}. Сформирован частичный контекст.`);
     } else {
-      html = await res.text();
+      html = await response.text();
     }
   } catch {
-    warnings.push("Не удалось получить главную страницу сайта, использован ограниченный контекст.");
+    warnings.push("Не удалось получить главную страницу сайта после повторов. Использован ограниченный контекст.");
   }
 
   const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
   const title = titleMatch ? titleMatch[1].replace(/\s+/g, " ").trim() : "Без названия";
-  const text = sample(html.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " "));
+  const text = sample(
+    html
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+  );
 
   const companyName = new URL(normalizedUrl).hostname.replace(/^www\./i, "");
   const context = [
@@ -139,18 +329,12 @@ async function collectContext(normalizedUrl) {
     "Дополнительные веб-источники/соцсети в MVP помечаются как сигнал для ручной проверки."
   ].join("\n");
 
-  const sources = [
-    { title: `Сайт компании (${companyName})`, url: normalizedUrl }
-  ];
+  const sources = [{ title: `Сайт компании (${companyName})`, url: normalizedUrl }];
 
   return { companyContext: context, sources, warnings };
 }
 
-function uniqId(prefix) {
-  return `${prefix}_${crypto.randomBytes(4).toString("hex")}`;
-}
-
-function makeIdeas(companyContext, exclude = []) {
+function makeIdeasFallback(companyContext, exclude = []) {
   const excludeSet = new Set(exclude);
   const usedTitles = new Set();
   const ideas = [];
@@ -160,6 +344,7 @@ function makeIdeas(companyContext, exclude = []) {
   for (const baseTitle of shuffled) {
     if (ideas.length === 5) break;
     if (excludeSet.has(baseTitle) || usedTitles.has(baseTitle)) continue;
+
     usedTitles.add(baseTitle);
     ideas.push({
       id: uniqId("idea"),
@@ -171,6 +356,7 @@ function makeIdeas(companyContext, exclude = []) {
   while (ideas.length < 5) {
     const title = `AI-инициатива ${ideas.length + 1}`;
     if (usedTitles.has(title)) continue;
+
     usedTitles.add(title);
     ideas.push({
       id: uniqId("idea"),
@@ -182,20 +368,40 @@ function makeIdeas(companyContext, exclude = []) {
   return ideas;
 }
 
+async function makeIdeas(companyContext, exclude = [], modelLevel = "standard") {
+  if (hasOpenAiKey()) {
+    try {
+      const llmIdeas = await generateIdeasWithLlm(companyContext, exclude, modelLevel);
+      if (Array.isArray(llmIdeas) && llmIdeas.length === 5) {
+        return {
+          ideas: llmIdeas.map((item) => ({
+            id: uniqId("idea"),
+            title: item.title,
+            description: item.description
+          })),
+          source: "llm"
+        };
+      }
+    } catch (error) {
+      console.error("llm_ideas_failed", { message: error?.message, modelLevel });
+    }
+  }
+
+  return { ideas: makeIdeasFallback(companyContext, exclude), source: "fallback" };
+}
+
 function getNextQuestion(index) {
   return QUESTION_FLOW[index] || null;
 }
 
 function resolveOptionLabels(question, selectedOptions = []) {
   if (!question || !Array.isArray(selectedOptions)) return [];
-  const optionMap = new Map(question.options.map((option) => [option.id, option.label]));
+  const optionMap = new Map((question.options || []).map((option) => [option.id, option.label]));
   return selectedOptions.map((optionId) => optionMap.get(optionId)).filter(Boolean);
 }
 
-function buildFinalConsultation(ideaTitle, answers) {
-  const brief = answers
-    .map((answer) => `${answer.question}: ${answer.value}`)
-    .join("; ");
+function buildFinalConsultationFallback(ideaTitle, answers) {
+  const brief = answers.map((answer) => `${answer.question}: ${answer.value}`).join("; ");
 
   return [
     `**Суть проекта**\n${ideaTitle} фокусируется на прикладном внедрении ИИ в приоритетный процесс компании с быстрым запуском MVP и последующим масштабированием на смежные функции.`,
@@ -207,16 +413,70 @@ function buildFinalConsultation(ideaTitle, answers) {
   ].join("\n\n");
 }
 
+async function buildFinalConsultation({ ideaTitle, answers, companyContext, modelLevel }) {
+  if (hasOpenAiKey()) {
+    try {
+      const generated = await generateFinalWithLlm({ ideaTitle, answers, companyContext, modelLevel });
+      if (generated && generated.length >= 300) return { text: generated, source: "llm" };
+    } catch (error) {
+      console.error("llm_final_failed", { message: error?.message, modelLevel });
+    }
+  }
+
+  return { text: buildFinalConsultationFallback(ideaTitle, answers), source: "fallback" };
+}
+
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
 });
 
+app.get("/api/settings", (_req, res) => {
+  res.json({
+    hasServerKey: hasOpenAiKey(),
+    keySource: process.env.OPENAI_API_KEY ? "env" : "runtime",
+    defaultModelLevel: runtimeConfig.defaultModelLevel,
+    modelLevels: MODEL_LEVELS,
+    modelsByLevel: MODEL_BY_LEVEL
+  });
+});
+
+app.post("/api/settings", (req, res) => {
+  const rawKey = typeof req.body?.apiKey === "string" ? req.body.apiKey.trim() : null;
+  const rawLevel = typeof req.body?.modelLevel === "string" ? req.body.modelLevel : null;
+
+  if (rawKey !== null) {
+    if (!rawKey) {
+      runtimeConfig.openaiApiKey = "";
+    } else if (!rawKey.startsWith("sk-")) {
+      return res.status(400).json({ error: "Некорректный формат API-ключа" });
+    } else {
+      runtimeConfig.openaiApiKey = rawKey;
+    }
+  }
+
+  if (rawLevel !== null) {
+    runtimeConfig.defaultModelLevel = normalizeModelLevel(rawLevel);
+  }
+
+  return res.json({
+    ok: true,
+    hasServerKey: hasOpenAiKey(),
+    defaultModelLevel: runtimeConfig.defaultModelLevel
+  });
+});
+
 app.post("/api/analyze", async (req, res) => {
+  const clientIp = getClientIp(req);
+  if (!checkAnalyzeRateLimit(clientIp)) {
+    return res.status(429).json({ error: "Слишком много запусков анализа. Повторите через минуту." });
+  }
+
   const normalizedUrl = normalizeUrl(req.body?.url);
   if (!normalizedUrl) {
     return res.status(400).json({ error: "Некорректный URL. Укажите адрес сайта в формате company.com или https://company.com" });
   }
 
+  const modelLevel = normalizeModelLevel(req.body?.modelLevel);
   const analysisId = uniqId("an");
   const { companyContext, sources, warnings } = await collectContext(normalizedUrl);
 
@@ -226,6 +486,7 @@ app.post("/api/analyze", async (req, res) => {
     companyContext,
     sources,
     warnings,
+    modelLevel,
     createdAt: Date.now(),
     ideas: []
   });
@@ -235,22 +496,23 @@ app.post("/api/analyze", async (req, res) => {
     status: "done",
     companyContext,
     sources,
-    warnings
+    warnings,
+    modelLevel
   });
 });
 
-app.post("/api/ideas/generate", (req, res) => {
+app.post("/api/ideas/generate", async (req, res) => {
   const analysis = analyses.get(req.body?.analysisId);
   if (!analysis) return res.status(404).json({ error: "analysisId не найден" });
 
-  const ideas = makeIdeas(analysis.companyContext);
-  analysis.ideas = ideas;
+  const generated = await makeIdeas(analysis.companyContext, [], analysis.modelLevel);
+  analysis.ideas = generated.ideas;
   analyses.set(analysis.analysisId, analysis);
 
-  return res.json({ ideas });
+  return res.json({ ideas: generated.ideas, generatedBy: generated.source, modelLevel: analysis.modelLevel });
 });
 
-app.post("/api/ideas/regenerate", (req, res) => {
+app.post("/api/ideas/regenerate", async (req, res) => {
   const analysis = analyses.get(req.body?.analysisId);
   if (!analysis) return res.status(404).json({ error: "analysisId не найден" });
 
@@ -259,11 +521,11 @@ app.post("/api/ideas/regenerate", (req, res) => {
     .filter((idea) => excludeIdeaIds.includes(idea.id))
     .map((idea) => idea.title);
 
-  const ideas = makeIdeas(analysis.companyContext, excludedTitles);
-  analysis.ideas = ideas;
+  const generated = await makeIdeas(analysis.companyContext, excludedTitles, analysis.modelLevel);
+  analysis.ideas = generated.ideas;
   analyses.set(analysis.analysisId, analysis);
 
-  return res.json({ ideas });
+  return res.json({ ideas: generated.ideas, generatedBy: generated.source, modelLevel: analysis.modelLevel });
 });
 
 app.post("/api/chat/start", (req, res) => {
@@ -291,7 +553,7 @@ app.post("/api/chat/start", (req, res) => {
   });
 });
 
-app.post("/api/chat/message", (req, res) => {
+app.post("/api/chat/message", async (req, res) => {
   const { chatId, message, selectedOptions } = req.body ?? {};
   const chat = chats.get(chatId);
   if (!chat) return res.status(404).json({ error: "chatId не найден" });
@@ -301,10 +563,8 @@ app.post("/api/chat/message", (req, res) => {
     return res.status(400).json({ error: "Опрос уже завершен" });
   }
 
-  if (currentQuestion.type === "multi") {
-    if (!Array.isArray(selectedOptions) || selectedOptions.length === 0) {
-      return res.status(400).json({ error: "Для множественного выбора нужно выбрать минимум один вариант" });
-    }
+  if (currentQuestion.type === "multi" && (!Array.isArray(selectedOptions) || selectedOptions.length === 0)) {
+    return res.status(400).json({ error: "Для множественного выбора нужно выбрать минимум один вариант" });
   }
 
   const value = currentQuestion.type === "free"
@@ -324,12 +584,26 @@ app.post("/api/chat/message", (req, res) => {
     });
   }
 
-  const finalText = buildFinalConsultation(chat.ideaTitle, chat.answers);
-  return res.json({
-    assistantMessage: finalText,
-    nextQuestion: null,
-    isFinal: true
+  const analysis = analyses.get(chat.analysisId);
+  const finalResult = await buildFinalConsultation({
+    ideaTitle: chat.ideaTitle,
+    answers: chat.answers,
+    companyContext: analysis?.companyContext || "Контекст не найден",
+    modelLevel: analysis?.modelLevel || runtimeConfig.defaultModelLevel
   });
+
+  return res.json({
+    assistantMessage: finalResult.text,
+    nextQuestion: null,
+    isFinal: true,
+    generatedBy: finalResult.source,
+    modelLevel: analysis?.modelLevel || runtimeConfig.defaultModelLevel
+  });
+});
+
+app.use((error, _req, res, _next) => {
+  console.error("unhandled_error", { message: error?.message });
+  return res.status(500).json({ error: "Внутренняя ошибка сервера" });
 });
 
 app.listen(PORT, () => {

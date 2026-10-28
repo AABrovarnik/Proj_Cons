@@ -255,3 +255,73 @@ button {
     min-height: 420px;
   }
 }
+
+.toast-container {
+  position: fixed;
+  top: 14px;
+  right: 14px;
+  z-index: 60;
+  display: grid;
+  gap: 8px;
+}
+
+.toast {
+  border-radius: 10px;
+  padding: 10px 12px;
+  min-width: 240px;
+  max-width: 360px;
+  color: #fff;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+.toast-info { background: #0a3d62; }
+.toast-success { background: #166534; }
+.toast-warn { background: #b45309; }
+.toast-error { background: #b91c1c; }
+
+.toast-hide {
+  opacity: 0;
+  transform: translateY(-6px);
+}
+
+.analysis-tools {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.analysis-tools label {
+  font-size: 14px;
+  color: #374151;
+}
+
+.analysis-tools select {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px 10px;
+  background: #fff;
+}
+
+.mode-status {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 6px 10px;
+  font-size: 12px;
+  background: #f3f4f6;
+  color: #1f2937;
+}
+
+.mode-status.llm {
+  background: #dcfce7;
+  border-color: #86efac;
+  color: #166534;
+}
+
+.mode-status.fallback {
+  background: #fef3c7;
+  border-color: #fcd34d;
+  color: #92400e;
+}

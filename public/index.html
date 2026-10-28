@@ -20,6 +20,17 @@
             <input id="urlInput" type="text" placeholder="https://example.com" />
             <button id="analyzeBtn" class="primary">Проанализировать</button>
           </div>
+
+          <div class="analysis-tools">
+            <label for="modelLevelSelect">Уровень модели</label>
+            <select id="modelLevelSelect">
+              <option value="basic">Базовый (быстро)</option>
+              <option value="standard" selected>Стандартный (баланс)</option>
+              <option value="advanced">Продвинутый (глубже)</option>
+            </select>
+            <span id="modeStatus" class="mode-status">Fallback-режим</span>
+          </div>
+
           <div id="progressBox" class="progress-box hidden"></div>
           <div id="analyzeError" class="error hidden"></div>
         </section>
@@ -54,7 +65,7 @@
     <div id="settingsModal" class="modal hidden">
       <div class="modal-content">
         <h3>Настройки</h3>
-        <label for="apiKeyInput">API-ключ OpenAI</label>
+        <label for="apiKeyInput">API-ключ OpenAI (backend)</label>
         <input id="apiKeyInput" type="password" placeholder="sk-..." />
         <div class="modal-actions">
           <button id="saveSettingsBtn" class="primary">Сохранить</button>

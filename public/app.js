@@ -1,10 +1,14 @@
+const STORAGE_KEY = "konsultant_state_v2";
+const MODEL_LEVELS = ["basic", "standard", "advanced"];
+
 const state = {
   analysisId: null,
   companyContext: "",
   ideas: [],
   tabs: [],
   activeTabId: null,
-  apiKey: localStorage.getItem("openai_api_key") || "",
+  hasServerKey: false,
+  modelLevel: "standard",
   currentQuestionByTab: {}
 };
 
@@ -35,14 +39,83 @@ const elements = {
   settingsModal: document.getElementById("settingsModal"),
   apiKeyInput: document.getElementById("apiKeyInput"),
   saveSettingsBtn: document.getElementById("saveSettingsBtn"),
-  closeSettingsBtn: document.getElementById("closeSettingsBtn")
+  closeSettingsBtn: document.getElementById("closeSettingsBtn"),
+  modelLevelSelect: document.getElementById("modelLevelSelect"),
+  modeStatus: document.getElementById("modeStatus")
 };
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+let toastContainer = null;
+
+function ensureToastContainer() {
+  if (toastContainer) return toastContainer;
+  toastContainer = document.createElement("div");
+  toastContainer.className = "toast-container";
+  document.body.appendChild(toastContainer);
+  return toastContainer;
+}
+
+function showToast(text, type = "info") {
+  const container = ensureToastContainer();
+  const toast = document.createElement("div");
+  toast.className = `toast toast-${type}`;
+  toast.textContent = text;
+  container.appendChild(toast);
+
+  setTimeout(() => {
+    toast.classList.add("toast-hide");
+    setTimeout(() => toast.remove(), 240);
+  }, 2600);
+}
+
+function serializeState() {
+  return JSON.stringify({
+    analysisId: state.analysisId,
+    companyContext: state.companyContext,
+    ideas: state.ideas,
+    tabs: state.tabs,
+    activeTabId: state.activeTabId,
+    modelLevel: state.modelLevel,
+    currentQuestionByTab: state.currentQuestionByTab
+  });
+}
+
+function persistState() {
+  localStorage.setItem(STORAGE_KEY, serializeState());
+}
+
+function hydrateState() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return;
+
+    const parsed = JSON.parse(raw);
+    state.analysisId = parsed.analysisId || null;
+    state.companyContext = parsed.companyContext || "";
+    state.ideas = Array.isArray(parsed.ideas) ? parsed.ideas : [];
+    state.tabs = Array.isArray(parsed.tabs) ? parsed.tabs : [];
+    state.activeTabId = parsed.activeTabId || state.tabs[0]?.chatId || null;
+    state.currentQuestionByTab = parsed.currentQuestionByTab && typeof parsed.currentQuestionByTab === "object"
+      ? parsed.currentQuestionByTab
+      : {};
+    state.modelLevel = MODEL_LEVELS.includes(parsed.modelLevel) ? parsed.modelLevel : state.modelLevel;
+  } catch {
+    localStorage.removeItem(STORAGE_KEY);
+  }
+}
+
+function mapErrorMessage(error) {
+  const text = String(error?.message || "");
+  if (text.includes("Failed to fetch")) return "Сервер недоступен. Проверьте, что приложение запущено на localhost:3001.";
+  if (text.includes("429")) return "Слишком много запросов. Подождите минуту и повторите.";
+  return text || "Произошла ошибка";
+}
 
 function showError(text) {
-  elements.analyzeError.textContent = text;
+  const friendly = mapErrorMessage({ message: text });
+  elements.analyzeError.textContent = friendly;
   elements.analyzeError.classList.remove("hidden");
+  showToast(friendly, "error");
 }
 
 function clearError() {
@@ -55,22 +128,43 @@ function normalizeInputUrl(raw) {
   return /^https?:\/\//i.test(raw.trim()) ? raw.trim() : `https://${raw.trim()}`;
 }
 
+function updateModeStatus() {
+  if (!elements.modeStatus) return;
+  const levelLabel = state.modelLevel === "basic" ? "Базовый" : state.modelLevel === "advanced" ? "Продвинутый" : "Стандартный";
+
+  if (state.hasServerKey) {
+    elements.modeStatus.textContent = `LLM: ${levelLabel}`;
+    elements.modeStatus.classList.add("llm");
+    elements.modeStatus.classList.remove("fallback");
+  } else {
+    elements.modeStatus.textContent = `Fallback: ${levelLabel}`;
+    elements.modeStatus.classList.add("fallback");
+    elements.modeStatus.classList.remove("llm");
+  }
+}
+
+async function apiGet(url) {
+  const response = await fetch(url);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || `${response.status}`);
+  return data;
+}
+
 async function apiPost(url, body) {
   const response = await fetch(url, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(state.apiKey ? { "x-openai-key": state.apiKey } : {})
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body)
   });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || "Ошибка API");
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || `${response.status}`);
   return data;
 }
 
 function renderIdeas() {
   elements.ideasList.innerHTML = "";
+
   state.ideas.forEach((idea) => {
     const card = document.createElement("article");
     card.className = "idea-card";
@@ -79,6 +173,7 @@ function renderIdeas() {
       <div class="idea-description">${idea.description}</div>
       <button class="primary" data-idea-id="${idea.id}">Обсудить</button>
     `;
+
     card.querySelector("button").addEventListener("click", () => startDiscussion(idea.id));
     elements.ideasList.appendChild(card);
   });
@@ -90,6 +185,7 @@ function renderIdeas() {
 
 function renderTabs() {
   elements.chatTabs.innerHTML = "";
+
   state.tabs.forEach((tab) => {
     const tabEl = document.createElement("button");
     tabEl.className = `tab ${tab.chatId === state.activeTabId ? "active" : ""}`;
@@ -100,10 +196,12 @@ function renderTabs() {
         closeTab(event.target.dataset.close);
         return;
       }
+
       state.activeTabId = tab.chatId;
       renderTabs();
       renderMessages();
       renderQuestion();
+      persistState();
     });
 
     elements.chatTabs.appendChild(tabEl);
@@ -126,28 +224,40 @@ function renderMessages() {
 function closeTab(chatId) {
   state.tabs = state.tabs.filter((tab) => tab.chatId !== chatId);
   delete state.currentQuestionByTab[chatId];
+
   if (state.activeTabId === chatId) {
     state.activeTabId = state.tabs[0]?.chatId || null;
   }
+
   renderTabs();
   renderMessages();
   renderQuestion();
+  persistState();
 }
 
 function getActiveTab() {
   return state.tabs.find((item) => item.chatId === state.activeTabId) || null;
 }
 
+function setFreeInputEnabled(enabled) {
+  elements.freeInput.disabled = !enabled;
+  elements.sendFreeBtn.disabled = !enabled;
+  elements.sendFreeBtn.style.opacity = enabled ? "1" : "0.5";
+  elements.sendFreeBtn.style.pointerEvents = enabled ? "auto" : "none";
+}
+
 function renderQuestion() {
   const active = getActiveTab();
+  elements.questionBlock.innerHTML = "";
+
   if (!active) {
-    elements.questionBlock.innerHTML = "";
+    setFreeInputEnabled(false);
     return;
   }
 
   const question = state.currentQuestionByTab[active.chatId];
   if (!question) {
-    elements.questionBlock.innerHTML = "";
+    setFreeInputEnabled(false);
     return;
   }
 
@@ -155,19 +265,17 @@ function renderQuestion() {
   wrapper.innerHTML = `<div><strong>${question.text}</strong></div>`;
 
   if (question.type === "free") {
-    elements.freeInput.disabled = false;
-    elements.sendFreeBtn.disabled = false;
-    elements.sendFreeBtn.style.opacity = "1";
-    elements.sendFreeBtn.style.pointerEvents = "auto";
+    setFreeInputEnabled(true);
   } else {
     const optionList = document.createElement("div");
     optionList.className = "option-list";
     const selected = new Set();
 
-    question.options.forEach((opt) => {
+    (question.options || []).forEach((opt) => {
       const button = document.createElement("button");
       button.className = "option-btn";
       button.textContent = opt.label;
+
       button.addEventListener("click", async () => {
         if (question.type === "single") {
           await submitAnswer({ selectedOptions: [opt.id], message: "" });
@@ -181,8 +289,10 @@ function renderQuestion() {
           selected.add(opt.id);
           button.classList.add("active");
         }
+
         updateMultiSendBtn(Array.from(selected));
       });
+
       optionList.appendChild(button);
     });
 
@@ -194,6 +304,7 @@ function renderQuestion() {
       sendMulti.textContent = "Отправить";
       sendMulti.style.opacity = "0.5";
       sendMulti.style.pointerEvents = "none";
+
       sendMulti.addEventListener("click", async () => {
         const selectedOptions = Array.from(selected);
         if (!selectedOptions.length) return;
@@ -211,12 +322,11 @@ function renderQuestion() {
       }
 
       wrapper.appendChild(sendMulti);
-      elements.freeInput.disabled = true;
-      elements.sendFreeBtn.disabled = true;
     }
+
+    setFreeInputEnabled(false);
   }
 
-  elements.questionBlock.innerHTML = "";
   elements.questionBlock.appendChild(wrapper);
 }
 
@@ -228,10 +338,13 @@ async function submitAnswer({ selectedOptions, message }) {
   if (!currentQuestion) return;
 
   const userText = currentQuestion.type === "free"
-    ? message
+    ? (message || "")
     : (currentQuestion.type === "single"
       ? currentQuestion.options.find((opt) => opt.id === selectedOptions[0])?.label
-      : currentQuestion.options.filter((opt) => selectedOptions.includes(opt.id)).map((opt) => opt.label).join(", "));
+      : currentQuestion.options
+        .filter((opt) => selectedOptions.includes(opt.id))
+        .map((opt) => opt.label)
+        .join(", "));
 
   active.messages.push({ role: "user", text: userText || "(без ответа)" });
   renderMessages();
@@ -248,28 +361,32 @@ async function submitAnswer({ selectedOptions, message }) {
 
     if (result.isFinal) {
       state.currentQuestionByTab[active.chatId] = null;
-      elements.freeInput.disabled = true;
-      elements.sendFreeBtn.disabled = true;
+      setFreeInputEnabled(false);
+      showToast(`Консультация сформирована (${result.generatedBy || "fallback"})`, "success");
     }
   } catch (error) {
-    active.messages.push({ role: "bot", text: `Ошибка: ${error.message}` });
+    const friendly = mapErrorMessage(error);
+    active.messages.push({ role: "bot", text: `Ошибка: ${friendly}` });
+    showToast(friendly, "error");
   }
 
   elements.freeInput.value = "";
   renderMessages();
   renderQuestion();
+  persistState();
 }
 
 async function animateProgress() {
   elements.progressBox.classList.remove("hidden");
   for (const step of progressSteps) {
     elements.progressBox.textContent = step;
-    await sleep(450);
+    await sleep(850);
   }
 }
 
 async function runAnalyze() {
   clearError();
+
   const normalized = normalizeInputUrl(elements.urlInput.value);
   if (!normalized) {
     showError("Введите корректный URL сайта.");
@@ -277,15 +394,19 @@ async function runAnalyze() {
   }
 
   elements.analyzeBtn.disabled = true;
+  elements.analyzeBtn.textContent = "Анализирую...";
   await animateProgress();
 
   try {
-    const data = await apiPost("/api/analyze", { url: normalized });
+    const data = await apiPost("/api/analyze", { url: normalized, modelLevel: state.modelLevel });
     state.analysisId = data.analysisId;
     state.companyContext = data.companyContext;
 
     const ideasResponse = await apiPost("/api/ideas/generate", { analysisId: state.analysisId });
     state.ideas = ideasResponse.ideas;
+    state.tabs = [];
+    state.activeTabId = null;
+    state.currentQuestionByTab = {};
 
     elements.ideasSection.classList.remove("hidden");
     elements.chatSection.classList.remove("hidden");
@@ -294,26 +415,42 @@ async function runAnalyze() {
     renderTabs();
     renderMessages();
     renderQuestion();
+    persistState();
+
+    showToast(`Анализ завершён, идеи: ${ideasResponse.generatedBy || "fallback"}`, "success");
 
     if (Array.isArray(data.warnings) && data.warnings.length) {
-      showError(data.warnings.join(" "));
+      showToast(data.warnings.join(" "), "warn");
     }
   } catch (error) {
-    showError(error.message);
+    showError(mapErrorMessage(error));
   } finally {
     elements.analyzeBtn.disabled = false;
+    elements.analyzeBtn.textContent = "Проанализировать";
   }
 }
 
 async function regenerateIdeas() {
-  if (!state.analysisId) return;
+  if (!state.analysisId) {
+    showToast("Сначала выполните анализ сайта", "warn");
+    return;
+  }
+
+  elements.regenerateBtn.disabled = true;
+  elements.regenerateBtn.textContent = "Генерирую...";
+
   const excludeIdeaIds = state.ideas.map((idea) => idea.id);
   try {
     const result = await apiPost("/api/ideas/regenerate", { analysisId: state.analysisId, excludeIdeaIds });
     state.ideas = result.ideas;
     renderIdeas();
+    persistState();
+    showToast(`Новый набор идей готов (${result.generatedBy || "fallback"})`, "success");
   } catch (error) {
-    showError(error.message);
+    showError(mapErrorMessage(error));
+  } finally {
+    elements.regenerateBtn.disabled = false;
+    elements.regenerateBtn.textContent = "Перегенерировать";
   }
 }
 
@@ -327,6 +464,7 @@ async function startDiscussion(ideaId) {
     renderTabs();
     renderMessages();
     renderQuestion();
+    persistState();
     return;
   }
 
@@ -346,13 +484,35 @@ async function startDiscussion(ideaId) {
     renderTabs();
     renderMessages();
     renderQuestion();
+    persistState();
   } catch (error) {
-    showError(error.message);
+    showError(mapErrorMessage(error));
+  }
+}
+
+async function loadSettingsState() {
+  try {
+    const data = await apiGet("/api/settings");
+    state.hasServerKey = Boolean(data.hasServerKey);
+    state.modelLevel = MODEL_LEVELS.includes(data.defaultModelLevel) ? data.defaultModelLevel : state.modelLevel;
+
+    if (elements.modelLevelSelect) {
+      elements.modelLevelSelect.value = state.modelLevel;
+    }
+
+    updateModeStatus();
+    if (state.hasServerKey) {
+      showToast("Backend-ключ активен", "info");
+    } else {
+      showToast("Ключ не задан: используется fallback-режим", "warn");
+    }
+  } catch {
+    showToast("Не удалось загрузить настройки backend", "warn");
   }
 }
 
 function bindSettings() {
-  elements.apiKeyInput.value = state.apiKey;
+  elements.apiKeyInput.value = "";
 
   elements.settingsBtn.addEventListener("click", () => {
     elements.settingsModal.classList.remove("hidden");
@@ -360,13 +520,53 @@ function bindSettings() {
 
   elements.closeSettingsBtn.addEventListener("click", () => {
     elements.settingsModal.classList.add("hidden");
+    elements.apiKeyInput.value = "";
   });
 
-  elements.saveSettingsBtn.addEventListener("click", () => {
-    state.apiKey = elements.apiKeyInput.value.trim();
-    localStorage.setItem("openai_api_key", state.apiKey);
-    elements.settingsModal.classList.add("hidden");
+  elements.saveSettingsBtn.addEventListener("click", async () => {
+    const apiKey = elements.apiKeyInput.value.trim();
+
+    try {
+      const result = await apiPost("/api/settings", { apiKey, modelLevel: state.modelLevel });
+      state.hasServerKey = Boolean(result.hasServerKey);
+      elements.apiKeyInput.value = "";
+      elements.settingsModal.classList.add("hidden");
+      updateModeStatus();
+      showToast(state.hasServerKey ? "Ключ сохранён на backend" : "Ключ очищен", "success");
+    } catch (error) {
+      showToast(mapErrorMessage(error), "error");
+    }
   });
+
+  elements.modelLevelSelect.addEventListener("change", async (event) => {
+    const selectedLevel = event.target.value;
+    state.modelLevel = MODEL_LEVELS.includes(selectedLevel) ? selectedLevel : "standard";
+    persistState();
+    updateModeStatus();
+
+    try {
+      await apiPost("/api/settings", { modelLevel: state.modelLevel });
+      showToast(`Уровень модели: ${state.modelLevel}`, "info");
+    } catch (error) {
+      showToast(mapErrorMessage(error), "warn");
+    }
+  });
+}
+
+function restoreUiFromState() {
+  if (elements.modelLevelSelect) {
+    elements.modelLevelSelect.value = state.modelLevel;
+  }
+
+  if (!state.ideas.length) return;
+
+  elements.ideasSection.classList.remove("hidden");
+  elements.chatSection.classList.remove("hidden");
+
+  renderIdeas();
+  renderTabs();
+  renderMessages();
+  renderQuestion();
 }
 
 elements.analyzeBtn.addEventListener("click", runAnalyze);
@@ -375,7 +575,11 @@ elements.sendFreeBtn.addEventListener("click", async () => {
   const active = getActiveTab();
   const question = active ? state.currentQuestionByTab[active.chatId] : null;
   if (!question || question.type !== "free") return;
+
   await submitAnswer({ selectedOptions: [], message: elements.freeInput.value.trim() });
 });
 
+hydrateState();
 bindSettings();
+restoreUiFromState();
+loadSettingsState();
