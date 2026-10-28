@@ -9,6 +9,8 @@ const state = {
   activeTabId: null,
   hasServerKey: false,
   modelLevel: "standard",
+  lastGenerationSource: "fallback",
+  lastGenerationLevel: "standard",
   currentQuestionByTab: {}
 };
 
@@ -41,7 +43,8 @@ const elements = {
   saveSettingsBtn: document.getElementById("saveSettingsBtn"),
   closeSettingsBtn: document.getElementById("closeSettingsBtn"),
   modelLevelSelect: document.getElementById("modelLevelSelect"),
-  modeStatus: document.getElementById("modeStatus")
+  modeStatus: document.getElementById("modeStatus"),
+  generationMeta: document.getElementById("generationMeta")
 };
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -76,6 +79,8 @@ function serializeState() {
     tabs: state.tabs,
     activeTabId: state.activeTabId,
     modelLevel: state.modelLevel,
+    lastGenerationSource: state.lastGenerationSource,
+    lastGenerationLevel: state.lastGenerationLevel,
     currentQuestionByTab: state.currentQuestionByTab
   });
 }
@@ -95,10 +100,12 @@ function hydrateState() {
     state.ideas = Array.isArray(parsed.ideas) ? parsed.ideas : [];
     state.tabs = Array.isArray(parsed.tabs) ? parsed.tabs : [];
     state.activeTabId = parsed.activeTabId || state.tabs[0]?.chatId || null;
+    state.modelLevel = MODEL_LEVELS.includes(parsed.modelLevel) ? parsed.modelLevel : state.modelLevel;
+    state.lastGenerationSource = parsed.lastGenerationSource || state.lastGenerationSource;
+    state.lastGenerationLevel = MODEL_LEVELS.includes(parsed.lastGenerationLevel) ? parsed.lastGenerationLevel : state.lastGenerationLevel;
     state.currentQuestionByTab = parsed.currentQuestionByTab && typeof parsed.currentQuestionByTab === "object"
       ? parsed.currentQuestionByTab
       : {};
-    state.modelLevel = MODEL_LEVELS.includes(parsed.modelLevel) ? parsed.modelLevel : state.modelLevel;
   } catch {
     localStorage.removeItem(STORAGE_KEY);
   }
@@ -128,9 +135,15 @@ function normalizeInputUrl(raw) {
   return /^https?:\/\//i.test(raw.trim()) ? raw.trim() : `https://${raw.trim()}`;
 }
 
+function getLevelLabel(level) {
+  if (level === "basic") return "Базовый";
+  if (level === "advanced") return "Продвинутый";
+  return "Стандартный";
+}
+
 function updateModeStatus() {
   if (!elements.modeStatus) return;
-  const levelLabel = state.modelLevel === "basic" ? "Базовый" : state.modelLevel === "advanced" ? "Продвинутый" : "Стандартный";
+  const levelLabel = getLevelLabel(state.modelLevel);
 
   if (state.hasServerKey) {
     elements.modeStatus.textContent = `LLM: ${levelLabel}`;
@@ -141,6 +154,16 @@ function updateModeStatus() {
     elements.modeStatus.classList.add("fallback");
     elements.modeStatus.classList.remove("llm");
   }
+}
+
+function updateGenerationMeta() {
+  if (!elements.generationMeta) return;
+  const levelLabel = getLevelLabel(state.lastGenerationLevel);
+  const sourceLabel = state.lastGenerationSource === "llm" ? "LLM" : "Fallback";
+
+  elements.generationMeta.textContent = `Режим генерации: ${sourceLabel} · ${levelLabel}`;
+  elements.generationMeta.classList.toggle("llm", sourceLabel === "LLM");
+  elements.generationMeta.classList.toggle("fallback", sourceLabel !== "LLM");
 }
 
 async function apiGet(url) {
@@ -404,6 +427,8 @@ async function runAnalyze() {
 
     const ideasResponse = await apiPost("/api/ideas/generate", { analysisId: state.analysisId });
     state.ideas = ideasResponse.ideas;
+    state.lastGenerationSource = ideasResponse.generatedBy || "fallback";
+    state.lastGenerationLevel = ideasResponse.modelLevel || state.modelLevel;
     state.tabs = [];
     state.activeTabId = null;
     state.currentQuestionByTab = {};
@@ -412,13 +437,13 @@ async function runAnalyze() {
     elements.chatSection.classList.remove("hidden");
 
     renderIdeas();
+    updateGenerationMeta();
     renderTabs();
     renderMessages();
     renderQuestion();
     persistState();
 
     showToast(`Анализ завершён, идеи: ${ideasResponse.generatedBy || "fallback"}`, "success");
-
     if (Array.isArray(data.warnings) && data.warnings.length) {
       showToast(data.warnings.join(" "), "warn");
     }
@@ -443,7 +468,10 @@ async function regenerateIdeas() {
   try {
     const result = await apiPost("/api/ideas/regenerate", { analysisId: state.analysisId, excludeIdeaIds });
     state.ideas = result.ideas;
+    state.lastGenerationSource = result.generatedBy || "fallback";
+    state.lastGenerationLevel = result.modelLevel || state.modelLevel;
     renderIdeas();
+    updateGenerationMeta();
     persistState();
     showToast(`Новый набор идей готов (${result.generatedBy || "fallback"})`, "success");
   } catch (error) {
@@ -501,6 +529,7 @@ async function loadSettingsState() {
     }
 
     updateModeStatus();
+    updateGenerationMeta();
     if (state.hasServerKey) {
       showToast("Backend-ключ активен", "info");
     } else {
@@ -539,10 +568,11 @@ function bindSettings() {
   });
 
   elements.modelLevelSelect.addEventListener("change", async (event) => {
-    const selectedLevel = event.target.value;
-    state.modelLevel = MODEL_LEVELS.includes(selectedLevel) ? selectedLevel : "standard";
+    state.modelLevel = MODEL_LEVELS.includes(event.target.value) ? event.target.value : "standard";
+    state.lastGenerationLevel = state.modelLevel;
     persistState();
     updateModeStatus();
+    updateGenerationMeta();
 
     try {
       await apiPost("/api/settings", { modelLevel: state.modelLevel });
@@ -557,6 +587,8 @@ function restoreUiFromState() {
   if (elements.modelLevelSelect) {
     elements.modelLevelSelect.value = state.modelLevel;
   }
+
+  updateGenerationMeta();
 
   if (!state.ideas.length) return;
 
