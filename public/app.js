@@ -11,7 +11,8 @@ const state = {
   modelLevel: "standard",
   lastGenerationSource: "fallback",
   lastGenerationLevel: "standard",
-  currentQuestionByTab: {}
+  currentQuestionByTab: {},
+  selectedOptionsByTab: {}
 };
 
 const progressSteps = [
@@ -81,7 +82,8 @@ function serializeState() {
     modelLevel: state.modelLevel,
     lastGenerationSource: state.lastGenerationSource,
     lastGenerationLevel: state.lastGenerationLevel,
-    currentQuestionByTab: state.currentQuestionByTab
+    currentQuestionByTab: state.currentQuestionByTab,
+    selectedOptionsByTab: state.selectedOptionsByTab
   });
 }
 
@@ -105,6 +107,9 @@ function hydrateState() {
     state.lastGenerationLevel = MODEL_LEVELS.includes(parsed.lastGenerationLevel) ? parsed.lastGenerationLevel : state.lastGenerationLevel;
     state.currentQuestionByTab = parsed.currentQuestionByTab && typeof parsed.currentQuestionByTab === "object"
       ? parsed.currentQuestionByTab
+      : {};
+    state.selectedOptionsByTab = parsed.selectedOptionsByTab && typeof parsed.selectedOptionsByTab === "object"
+      ? parsed.selectedOptionsByTab
       : {};
   } catch {
     localStorage.removeItem(STORAGE_KEY);
@@ -231,8 +236,25 @@ function renderTabs() {
   });
 }
 
+
+function updateChatMeta() {
+  if (!elements.chatMeta) return;
+  const active = getActiveTab();
+  if (!active) {
+    elements.chatMeta.textContent = "Источник вопросов: —";
+    elements.chatMeta.classList.remove("llm", "fallback");
+    return;
+  }
+
+  const source = active.questionSource === "llm" ? "LLM" : "Fallback";
+  const levelLabel = getLevelLabel(state.modelLevel);
+  elements.chatMeta.textContent = `Источник вопросов: ${source} · ${levelLabel}`;
+  elements.chatMeta.classList.toggle("llm", source === "LLM");
+  elements.chatMeta.classList.toggle("fallback", source !== "LLM");
+}
 function renderMessages() {
   const active = state.tabs.find((item) => item.chatId === state.activeTabId);
+  updateChatMeta();
   if (!active) {
     elements.messages.innerHTML = "<div class='message bot'>Выберите проект для обсуждения.</div>";
     return;
@@ -247,6 +269,7 @@ function renderMessages() {
 function closeTab(chatId) {
   state.tabs = state.tabs.filter((tab) => tab.chatId !== chatId);
   delete state.currentQuestionByTab[chatId];
+  delete state.selectedOptionsByTab[chatId];
 
   if (state.activeTabId === chatId) {
     state.activeTabId = state.tabs[0]?.chatId || null;
@@ -281,6 +304,7 @@ function renderQuestion() {
   const question = state.currentQuestionByTab[active.chatId];
   if (!question) {
     setFreeInputEnabled(false);
+    delete state.selectedOptionsByTab[active.chatId];
     return;
   }
 
@@ -292,7 +316,9 @@ function renderQuestion() {
   } else {
     const optionList = document.createElement("div");
     optionList.className = "option-list";
-    const selected = new Set();
+    const selected = new Set(Array.isArray(state.selectedOptionsByTab[active.chatId])
+      ? state.selectedOptionsByTab[active.chatId]
+      : []);
 
     (question.options || []).forEach((opt) => {
       const button = document.createElement("button");
@@ -301,6 +327,7 @@ function renderQuestion() {
 
       button.addEventListener("click", async () => {
         if (question.type === "single") {
+          delete state.selectedOptionsByTab[active.chatId];
           await submitAnswer({ selectedOptions: [opt.id], message: "" });
           return;
         }
@@ -313,8 +340,14 @@ function renderQuestion() {
           button.classList.add("active");
         }
 
+        state.selectedOptionsByTab[active.chatId] = Array.from(selected);
+        persistState();
         updateMultiSendBtn(Array.from(selected));
       });
+
+      if (selected.has(opt.id)) {
+        button.classList.add("active");
+      }
 
       optionList.appendChild(button);
     });
@@ -325,26 +358,30 @@ function renderQuestion() {
       const sendMulti = document.createElement("button");
       sendMulti.className = "primary";
       sendMulti.textContent = "Отправить";
+      sendMulti.disabled = true;
       sendMulti.style.opacity = "0.5";
       sendMulti.style.pointerEvents = "none";
 
-      sendMulti.addEventListener("click", async () => {
+      sendMulti.addEventListener("click", async (event) => {
+        event.preventDefault();
         const selectedOptions = Array.from(selected);
         if (!selectedOptions.length) return;
+
+        sendMulti.disabled = true;
+        sendMulti.textContent = "Отправляю...";
         await submitAnswer({ selectedOptions, message: "" });
       });
 
       function updateMultiSendBtn(selectedOptions) {
-        if (selectedOptions.length) {
-          sendMulti.style.opacity = "1";
-          sendMulti.style.pointerEvents = "auto";
-        } else {
-          sendMulti.style.opacity = "0.5";
-          sendMulti.style.pointerEvents = "none";
-        }
+        const enabled = selectedOptions.length > 0;
+        sendMulti.disabled = !enabled;
+        sendMulti.textContent = enabled ? `Отправить (${selectedOptions.length})` : "Отправить";
+        sendMulti.style.opacity = enabled ? "1" : "0.5";
+        sendMulti.style.pointerEvents = enabled ? "auto" : "none";
       }
 
       wrapper.appendChild(sendMulti);
+      updateMultiSendBtn(Array.from(selected));
     }
 
     setFreeInputEnabled(false);
@@ -353,6 +390,26 @@ function renderQuestion() {
   elements.questionBlock.appendChild(wrapper);
 }
 
+
+async function recoverChatSession(activeTab) {
+  if (!activeTab?.ideaId || !state.analysisId) {
+    showToast("Сессия чата устарела. Откройте проект заново.", "warn");
+    return;
+  }
+
+  showToast("Сессия чата устарела, переоткрываю...", "warn");
+  state.tabs = state.tabs.filter((tab) => tab.chatId !== activeTab.chatId);
+  delete state.currentQuestionByTab[activeTab.chatId];
+  delete state.selectedOptionsByTab[activeTab.chatId];
+  state.activeTabId = null;
+
+  renderTabs();
+  renderMessages();
+  renderQuestion();
+  persistState();
+
+  await startDiscussion(activeTab.ideaId);
+}
 async function submitAnswer({ selectedOptions, message }) {
   const active = getActiveTab();
   if (!active) return;
@@ -381,6 +438,7 @@ async function submitAnswer({ selectedOptions, message }) {
 
     active.messages.push({ role: "bot", text: result.assistantMessage });
     state.currentQuestionByTab[active.chatId] = result.nextQuestion;
+    delete state.selectedOptionsByTab[active.chatId];
 
     if (result.isFinal) {
       state.currentQuestionByTab[active.chatId] = null;
@@ -391,6 +449,11 @@ async function submitAnswer({ selectedOptions, message }) {
     const friendly = mapErrorMessage(error);
     active.messages.push({ role: "bot", text: `Ошибка: ${friendly}` });
     showToast(friendly, "error");
+
+    if (friendly.includes("chatId не найден")) {
+      await recoverChatSession(active);
+      return;
+    }
   }
 
   elements.freeInput.value = "";
@@ -432,6 +495,7 @@ async function runAnalyze() {
     state.tabs = [];
     state.activeTabId = null;
     state.currentQuestionByTab = {};
+    state.selectedOptionsByTab = {};
 
     elements.ideasSection.classList.remove("hidden");
     elements.chatSection.classList.remove("hidden");
@@ -502,12 +566,15 @@ async function startDiscussion(ideaId) {
       chatId: response.chatId,
       ideaId,
       ideaTitle: idea.title,
-      messages: [{ role: "bot", text: response.greeting }]
+      messages: [{ role: "bot", text: response.greeting }],
+      questionSource: response.questionSource || "fallback"
     };
 
     state.tabs.push(tab);
     state.activeTabId = tab.chatId;
     state.currentQuestionByTab[tab.chatId] = response.questions?.[0] || null;
+    state.selectedOptionsByTab[tab.chatId] = [];
+    showToast(`Опрос: ${response.questionSource || "fallback"} · ${response.modelLevel || state.modelLevel}`, "info");
 
     renderTabs();
     renderMessages();
@@ -606,7 +673,21 @@ elements.regenerateBtn.addEventListener("click", regenerateIdeas);
 elements.sendFreeBtn.addEventListener("click", async () => {
   const active = getActiveTab();
   const question = active ? state.currentQuestionByTab[active.chatId] : null;
-  if (!question || question.type !== "free") return;
+  if (!question) return;
+
+  if (question.type === "multi") {
+    const selectedOptions = Array.isArray(state.selectedOptionsByTab[active.chatId])
+      ? state.selectedOptionsByTab[active.chatId]
+      : [];
+    if (!selectedOptions.length) {
+      showToast("Выберите хотя бы один вариант", "warn");
+      return;
+    }
+    await submitAnswer({ selectedOptions, message: "" });
+    return;
+  }
+
+  if (question.type !== "free") return;
 
   await submitAnswer({ selectedOptions: [], message: elements.freeInput.value.trim() });
 });
@@ -615,3 +696,6 @@ hydrateState();
 bindSettings();
 restoreUiFromState();
 loadSettingsState();
+
+
+
