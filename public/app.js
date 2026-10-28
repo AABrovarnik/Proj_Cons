@@ -285,11 +285,43 @@ function getActiveTab() {
   return state.tabs.find((item) => item.chatId === state.activeTabId) || null;
 }
 
-function setFreeInputEnabled(enabled) {
-  elements.freeInput.disabled = !enabled;
-  elements.sendFreeBtn.disabled = !enabled;
-  elements.sendFreeBtn.style.opacity = enabled ? "1" : "0.5";
-  elements.sendFreeBtn.style.pointerEvents = enabled ? "auto" : "none";
+function configureBottomInput(question, selectedCount = 0) {
+  if (!question) {
+    elements.freeInput.value = "";
+    elements.freeInput.disabled = true;
+    elements.sendFreeBtn.textContent = "Отправить";
+    elements.sendFreeBtn.disabled = true;
+    elements.sendFreeBtn.style.opacity = "0.5";
+    elements.sendFreeBtn.style.pointerEvents = "none";
+    return;
+  }
+
+  if (question.type === "free") {
+    elements.freeInput.disabled = false;
+    elements.sendFreeBtn.textContent = "Отправить ответ";
+    elements.sendFreeBtn.disabled = false;
+    elements.sendFreeBtn.style.opacity = "1";
+    elements.sendFreeBtn.style.pointerEvents = "auto";
+    return;
+  }
+
+  elements.freeInput.disabled = true;
+
+  if (question.type === "multi") {
+    const hasSelection = selectedCount > 0;
+    elements.sendFreeBtn.textContent = hasSelection
+      ? `Отправить выбор (${selectedCount})`
+      : "Выберите варианты";
+    elements.sendFreeBtn.disabled = !hasSelection;
+    elements.sendFreeBtn.style.opacity = hasSelection ? "1" : "0.5";
+    elements.sendFreeBtn.style.pointerEvents = hasSelection ? "auto" : "none";
+    return;
+  }
+
+  elements.sendFreeBtn.textContent = "Выберите вариант";
+  elements.sendFreeBtn.disabled = true;
+  elements.sendFreeBtn.style.opacity = "0.5";
+  elements.sendFreeBtn.style.pointerEvents = "none";
 }
 
 function renderQuestion() {
@@ -297,13 +329,13 @@ function renderQuestion() {
   elements.questionBlock.innerHTML = "";
 
   if (!active) {
-    setFreeInputEnabled(false);
+    configureBottomInput(null);
     return;
   }
 
   const question = state.currentQuestionByTab[active.chatId];
   if (!question) {
-    setFreeInputEnabled(false);
+    configureBottomInput(null);
     delete state.selectedOptionsByTab[active.chatId];
     return;
   }
@@ -312,85 +344,57 @@ function renderQuestion() {
   wrapper.innerHTML = `<div><strong>${question.text}</strong></div>`;
 
   if (question.type === "free") {
-    setFreeInputEnabled(true);
-  } else {
-    const optionList = document.createElement("div");
-    optionList.className = "option-list";
-    const selected = new Set(Array.isArray(state.selectedOptionsByTab[active.chatId])
-      ? state.selectedOptionsByTab[active.chatId]
-      : []);
+    configureBottomInput(question, 0);
+    elements.questionBlock.appendChild(wrapper);
+    return;
+  }
 
-    (question.options || []).forEach((opt) => {
-      const button = document.createElement("button");
-      button.className = "option-btn";
-      button.textContent = opt.label;
+  const optionList = document.createElement("div");
+  optionList.className = "option-list";
+  const selected = new Set(Array.isArray(state.selectedOptionsByTab[active.chatId])
+    ? state.selectedOptionsByTab[active.chatId]
+    : []);
 
-      button.addEventListener("click", async () => {
-        if (question.type === "single") {
-          delete state.selectedOptionsByTab[active.chatId];
-          await submitAnswer({ selectedOptions: [opt.id], message: "" });
-          return;
-        }
+  (question.options || []).forEach((opt) => {
+    const button = document.createElement("button");
+    button.className = "option-btn";
+    button.textContent = opt.label;
 
-        if (selected.has(opt.id)) {
-          selected.delete(opt.id);
-          button.classList.remove("active");
-        } else {
-          selected.add(opt.id);
-          button.classList.add("active");
-        }
-
-        state.selectedOptionsByTab[active.chatId] = Array.from(selected);
-        persistState();
-      });
+    button.addEventListener("click", async () => {
+      if (question.type === "single") {
+        delete state.selectedOptionsByTab[active.chatId];
+        await submitAnswer({ selectedOptions: [opt.id], message: "" });
+        return;
+      }
 
       if (selected.has(opt.id)) {
+        selected.delete(opt.id);
+        button.classList.remove("active");
+      } else {
+        selected.add(opt.id);
         button.classList.add("active");
       }
 
-      optionList.appendChild(button);
+      state.selectedOptionsByTab[active.chatId] = Array.from(selected);
+      persistState();
+      configureBottomInput(question, selected.size);
     });
 
-    wrapper.appendChild(optionList);
-
-    if (question.type === "multi") {
-      const sendMulti = document.createElement("button");
-      sendMulti.className = "primary";
-      sendMulti.textContent = "Отправить выбор";
-
-      sendMulti.addEventListener("click", async (event) => {
-        event.preventDefault();
-        const selectedOptions = Array.from(selected);
-        if (!selectedOptions.length) {
-          showToast("Выберите хотя бы один вариант", "warn");
-          return;
-        }
-
-        sendMulti.disabled = true;
-        sendMulti.textContent = "Отправляю...";
-
-        try {
-          await submitAnswer({ selectedOptions, message: "" });
-        } finally {
-          sendMulti.disabled = false;
-          sendMulti.textContent = "Отправить выбор";
-        }
-      });
-
-      wrapper.appendChild(sendMulti);
+    if (selected.has(opt.id)) {
+      button.classList.add("active");
     }
 
-    if (question.type === "multi") {
-      elements.freeInput.disabled = true;
-      elements.sendFreeBtn.disabled = false;
-      elements.sendFreeBtn.style.opacity = "1";
-      elements.sendFreeBtn.style.pointerEvents = "auto";
-    } else {
-      setFreeInputEnabled(false);
-    }
-  }
+    optionList.appendChild(button);
+  });
 
+  wrapper.appendChild(optionList);
   elements.questionBlock.appendChild(wrapper);
+
+  if (question.type === "multi") {
+    configureBottomInput(question, selected.size);
+  } else {
+    configureBottomInput(question, 0);
+  }
 }
 
 async function recoverChatSession(activeTab) {
@@ -444,7 +448,7 @@ async function submitAnswer({ selectedOptions, message }) {
 
     if (result.isFinal) {
       state.currentQuestionByTab[active.chatId] = null;
-      setFreeInputEnabled(false);
+      configureBottomInput(null);
       showToast(`Консультация сформирована (${result.generatedBy || "fallback"})`, "success");
     }
   } catch (error) {
@@ -677,6 +681,11 @@ elements.sendFreeBtn.addEventListener("click", async () => {
   const question = active ? state.currentQuestionByTab[active.chatId] : null;
   if (!question) return;
 
+  if (question.type === "single") {
+    showToast("Выберите вариант из списка", "info");
+    return;
+  }
+
   if (question.type === "multi") {
     const selectedOptions = Array.isArray(state.selectedOptionsByTab[active.chatId])
       ? state.selectedOptionsByTab[active.chatId]
@@ -689,8 +698,6 @@ elements.sendFreeBtn.addEventListener("click", async () => {
     return;
   }
 
-  if (question.type !== "free") return;
-
   await submitAnswer({ selectedOptions: [], message: elements.freeInput.value.trim() });
 });
 
@@ -698,4 +705,6 @@ hydrateState();
 bindSettings();
 restoreUiFromState();
 loadSettingsState();
+
+
 
