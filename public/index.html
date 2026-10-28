@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Консультант по проектам</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="app-header">
+        <h1>Консультант по проектам</h1>
+        <button id="settingsBtn" class="icon-btn" title="Настройки">⚙</button>
+      </header>
+
+      <main>
+        <section class="panel" id="analyzeSection">
+          <h2>1. Анализ компании</h2>
+          <div class="url-row">
+            <input id="urlInput" type="text" placeholder="https://example.com" />
+            <button id="analyzeBtn" class="primary">Проанализировать</button>
+          </div>
+          <div id="progressBox" class="progress-box hidden"></div>
+          <div id="analyzeError" class="error hidden"></div>
+        </section>
+
+        <section class="panel hidden" id="ideasSection">
+          <h2>2. Идеи проектов</h2>
+          <div id="ideasList" class="ideas-list"></div>
+          <button id="regenerateBtn" class="secondary">Перегенерировать</button>
+        </section>
+
+        <section class="panel hidden" id="chatSection">
+          <h2>3. Обсуждение проекта</h2>
+          <div class="chat-tabs" id="chatTabs"></div>
+          <div class="chat-layout">
+            <aside class="projects-fixed">
+              <h3>Проекты</h3>
+              <div id="projectListFixed"></div>
+            </aside>
+            <div class="chat-window">
+              <div id="messages" class="messages"></div>
+              <div id="questionBlock" class="question-block"></div>
+              <div class="input-row">
+                <input id="freeInput" type="text" placeholder="Свободный комментарий" />
+                <button id="sendFreeBtn" class="primary">Отправить</button>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div id="settingsModal" class="modal hidden">
+      <div class="modal-content">
+        <h3>Настройки</h3>
+        <label for="apiKeyInput">API-ключ OpenAI</label>
+        <input id="apiKeyInput" type="password" placeholder="sk-..." />
+        <div class="modal-actions">
+          <button id="saveSettingsBtn" class="primary">Сохранить</button>
+          <button id="closeSettingsBtn" class="secondary">Закрыть</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
