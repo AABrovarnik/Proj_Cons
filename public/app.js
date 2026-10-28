@@ -12,7 +12,8 @@ const state = {
   lastGenerationSource: "fallback",
   lastGenerationLevel: "standard",
   currentQuestionByTab: {},
-  selectedOptionsByTab: {}
+  selectedOptionsByTab: {},
+  isSubmittingByTab: {}
 };
 
 const progressSteps = [
@@ -270,6 +271,7 @@ function closeTab(chatId) {
   state.tabs = state.tabs.filter((tab) => tab.chatId !== chatId);
   delete state.currentQuestionByTab[chatId];
   delete state.selectedOptionsByTab[chatId];
+  delete state.isSubmittingByTab[chatId];
 
   if (state.activeTabId === chatId) {
     state.activeTabId = state.tabs[0]?.chatId || null;
@@ -286,6 +288,9 @@ function getActiveTab() {
 }
 
 function configureBottomInput(question, selectedCount = 0) {
+  const active = getActiveTab();
+  const isSubmitting = active ? Boolean(state.isSubmittingByTab[active.chatId]) : false;
+
   if (!question) {
     elements.freeInput.value = "";
     elements.freeInput.disabled = true;
@@ -297,11 +302,11 @@ function configureBottomInput(question, selectedCount = 0) {
   }
 
   if (question.type === "free") {
-    elements.freeInput.disabled = false;
-    elements.sendFreeBtn.textContent = "Отправить ответ";
-    elements.sendFreeBtn.disabled = false;
-    elements.sendFreeBtn.style.opacity = "1";
-    elements.sendFreeBtn.style.pointerEvents = "auto";
+    elements.freeInput.disabled = isSubmitting;
+    elements.sendFreeBtn.textContent = isSubmitting ? "Отправляю..." : "Отправить ответ";
+    elements.sendFreeBtn.disabled = isSubmitting;
+    elements.sendFreeBtn.style.opacity = isSubmitting ? "0.5" : "1";
+    elements.sendFreeBtn.style.pointerEvents = isSubmitting ? "none" : "auto";
     return;
   }
 
@@ -309,16 +314,18 @@ function configureBottomInput(question, selectedCount = 0) {
 
   if (question.type === "multi") {
     const hasSelection = selectedCount > 0;
-    elements.sendFreeBtn.textContent = hasSelection
-      ? `Отправить выбор (${selectedCount})`
-      : "Выберите варианты";
-    elements.sendFreeBtn.disabled = !hasSelection;
-    elements.sendFreeBtn.style.opacity = hasSelection ? "1" : "0.5";
-    elements.sendFreeBtn.style.pointerEvents = hasSelection ? "auto" : "none";
+    elements.sendFreeBtn.textContent = isSubmitting
+      ? "Отправляю..."
+      : hasSelection
+        ? `Отправить выбор (${selectedCount})`
+        : "Выберите варианты";
+    elements.sendFreeBtn.disabled = isSubmitting || !hasSelection;
+    elements.sendFreeBtn.style.opacity = isSubmitting || !hasSelection ? "0.5" : "1";
+    elements.sendFreeBtn.style.pointerEvents = isSubmitting || !hasSelection ? "none" : "auto";
     return;
   }
 
-  elements.sendFreeBtn.textContent = "Выберите вариант";
+  elements.sendFreeBtn.textContent = isSubmitting ? "Отправляю..." : "Выберите вариант";
   elements.sendFreeBtn.disabled = true;
   elements.sendFreeBtn.style.opacity = "0.5";
   elements.sendFreeBtn.style.pointerEvents = "none";
@@ -407,6 +414,7 @@ async function recoverChatSession(activeTab) {
   state.tabs = state.tabs.filter((tab) => tab.chatId !== activeTab.chatId);
   delete state.currentQuestionByTab[activeTab.chatId];
   delete state.selectedOptionsByTab[activeTab.chatId];
+  delete state.isSubmittingByTab[activeTab.chatId];
   state.activeTabId = null;
 
   renderTabs();
@@ -423,12 +431,32 @@ async function submitAnswer({ selectedOptions, message }) {
   const currentQuestion = state.currentQuestionByTab[active.chatId];
   if (!currentQuestion) return;
 
+  if (state.isSubmittingByTab[active.chatId]) {
+    return;
+  }
+
+  const normalizedMessage = (message || "").trim();
+  const normalizedSelectedOptions = Array.isArray(selectedOptions) ? selectedOptions : [];
+
+  if (currentQuestion.type === "free" && !normalizedMessage) {
+    showToast("Введите ответ перед отправкой", "warn");
+    return;
+  }
+
+  if (currentQuestion.type === "multi" && !normalizedSelectedOptions.length) {
+    showToast("Выберите хотя бы один вариант", "warn");
+    return;
+  }
+
+  state.isSubmittingByTab[active.chatId] = true;
+  configureBottomInput(currentQuestion, normalizedSelectedOptions.length);
+
   const userText = currentQuestion.type === "free"
-    ? (message || "")
+    ? normalizedMessage
     : (currentQuestion.type === "single"
-      ? currentQuestion.options.find((opt) => opt.id === selectedOptions[0])?.label
+      ? currentQuestion.options.find((opt) => opt.id === normalizedSelectedOptions[0])?.label
       : currentQuestion.options
-        .filter((opt) => selectedOptions.includes(opt.id))
+        .filter((opt) => normalizedSelectedOptions.includes(opt.id))
         .map((opt) => opt.label)
         .join(", "));
 
@@ -438,8 +466,8 @@ async function submitAnswer({ selectedOptions, message }) {
   try {
     const result = await apiPost("/api/chat/message", {
       chatId: active.chatId,
-      message,
-      selectedOptions
+      message: normalizedMessage,
+      selectedOptions: normalizedSelectedOptions
     });
 
     active.messages.push({ role: "bot", text: result.assistantMessage });
@@ -460,6 +488,8 @@ async function submitAnswer({ selectedOptions, message }) {
       await recoverChatSession(active);
       return;
     }
+  } finally {
+    state.isSubmittingByTab[active.chatId] = false;
   }
 
   elements.freeInput.value = "";
@@ -502,6 +532,7 @@ async function runAnalyze() {
     state.activeTabId = null;
     state.currentQuestionByTab = {};
     state.selectedOptionsByTab = {};
+    state.isSubmittingByTab = {};
 
     elements.ideasSection.classList.remove("hidden");
     elements.chatSection.classList.remove("hidden");
@@ -580,6 +611,7 @@ async function startDiscussion(ideaId) {
     state.activeTabId = tab.chatId;
     state.currentQuestionByTab[tab.chatId] = response.questions?.[0] || null;
     state.selectedOptionsByTab[tab.chatId] = [];
+    state.isSubmittingByTab[tab.chatId] = false;
     showToast(`Опрос: ${response.questionSource || "fallback"} · ${response.modelLevel || state.modelLevel}`, "info");
 
     renderTabs();
@@ -681,6 +713,8 @@ elements.sendFreeBtn.addEventListener("click", async () => {
   const question = active ? state.currentQuestionByTab[active.chatId] : null;
   if (!question) return;
 
+  if (state.isSubmittingByTab[active.chatId]) return;
+
   if (question.type === "single") {
     showToast("Выберите вариант из списка", "info");
     return;
@@ -705,6 +739,4 @@ hydrateState();
 bindSettings();
 restoreUiFromState();
 loadSettingsState();
-
-
 
