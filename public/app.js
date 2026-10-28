@@ -342,7 +342,6 @@ function renderQuestion() {
 
         state.selectedOptionsByTab[active.chatId] = Array.from(selected);
         persistState();
-        updateMultiSendBtn(Array.from(selected));
       });
 
       if (selected.has(opt.id)) {
@@ -357,39 +356,42 @@ function renderQuestion() {
     if (question.type === "multi") {
       const sendMulti = document.createElement("button");
       sendMulti.className = "primary";
-      sendMulti.textContent = "Отправить";
-      sendMulti.disabled = true;
-      sendMulti.style.opacity = "0.5";
-      sendMulti.style.pointerEvents = "none";
+      sendMulti.textContent = "Отправить выбор";
 
       sendMulti.addEventListener("click", async (event) => {
         event.preventDefault();
         const selectedOptions = Array.from(selected);
-        if (!selectedOptions.length) return;
+        if (!selectedOptions.length) {
+          showToast("Выберите хотя бы один вариант", "warn");
+          return;
+        }
 
         sendMulti.disabled = true;
         sendMulti.textContent = "Отправляю...";
-        await submitAnswer({ selectedOptions, message: "" });
+
+        try {
+          await submitAnswer({ selectedOptions, message: "" });
+        } finally {
+          sendMulti.disabled = false;
+          sendMulti.textContent = "Отправить выбор";
+        }
       });
 
-      function updateMultiSendBtn(selectedOptions) {
-        const enabled = selectedOptions.length > 0;
-        sendMulti.disabled = !enabled;
-        sendMulti.textContent = enabled ? `Отправить (${selectedOptions.length})` : "Отправить";
-        sendMulti.style.opacity = enabled ? "1" : "0.5";
-        sendMulti.style.pointerEvents = enabled ? "auto" : "none";
-      }
-
       wrapper.appendChild(sendMulti);
-      updateMultiSendBtn(Array.from(selected));
     }
 
-    setFreeInputEnabled(false);
+    if (question.type === "multi") {
+      elements.freeInput.disabled = true;
+      elements.sendFreeBtn.disabled = false;
+      elements.sendFreeBtn.style.opacity = "1";
+      elements.sendFreeBtn.style.pointerEvents = "auto";
+    } else {
+      setFreeInputEnabled(false);
+    }
   }
 
   elements.questionBlock.appendChild(wrapper);
 }
-
 
 async function recoverChatSession(activeTab) {
   if (!activeTab?.ideaId || !state.analysisId) {
@@ -696,6 +698,4 @@ hydrateState();
 bindSettings();
 restoreUiFromState();
 loadSettingsState();
-
-
 
